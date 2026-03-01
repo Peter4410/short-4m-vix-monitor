@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-monitor.py — Short 4-Month VIX Futures entry/exit monitor (v3.0)
+monitor.py — Short 4-Month VIX Futures entry/exit monitor (v3.1)
 
 Strategy:
   TIER 1 (aggressive): VIX < 18  AND contango ≥ 3.0 pts
@@ -18,18 +18,28 @@ Exit triggers (checked every day regardless of entry):
   WARNING   : backwardation — contango < 0
   WARNING   : elevated regime — VIX > EWMA
 
+FOMC filter (Tier 1 only — Sinclair Ch5 p97–98):
+  VIX futures are elevated in the days before FOMC announcements and drop
+  after.  If an FOMC meeting falls within 3 calendar days of today, or
+  today is 1 calendar day after a meeting, Tier 1 entry is flagged for delay.
+  Tier 2 entries are unaffected (variance premium is larger, FOMC effect
+  smaller relative to noise).  FOMC dates are fetched from the Federal
+  Reserve website; a hardcoded fallback list covers 2025–2027.
+
 Data sources (all free, no API key):
   VIX spot + history → Yahoo Finance  ^VIX   (via yfinance)
   VIX 6-month        → Yahoo Finance  ^VIX6M (via yfinance)
   Contango           → ^VIX6M − ^VIX (6M constant-maturity proxy for 4M futures premium)
   20d avg / EWMA     → computed from 60-day VIX history
+  FOMC dates         → federalreserve.gov (with hardcoded fallback)
 """
 
 import os
+import re
 import sys
 import time
 import logging
-from datetime import date
+from datetime import date, timedelta
 
 import yfinance as yf
 import pandas as pd
@@ -57,6 +67,29 @@ SIZE_HIGH_VIX   = 22.0   # VIX = this → 0.5× (min size for entry)
 
 RETRIES         = 3
 RETRY_DELAY     = 5      # seconds × attempt number
+
+# ── FOMC filter parameters ────────────────────────────────────────────────────
+FOMC_PRE_HOLD_DAYS  = 3   # Hold Tier 1 if FOMC is within this many calendar days ahead
+FOMC_POST_HOLD_DAYS = 1   # Hold Tier 1 for this many calendar days after FOMC day
+#                           First safe entry = FOMC date + (FOMC_POST_HOLD_DAYS + 1) days
+
+# Hardcoded fallback: FOMC announcement dates (last day of each 2-day meeting).
+# Used when the Fed website cannot be reached or parsed.
+# Update annually when the Fed publishes the next year's calendar.
+FOMC_DATES_FALLBACK = [
+    # 2025
+    date(2025, 1, 29), date(2025, 3, 19), date(2025, 5, 7),
+    date(2025, 6, 18), date(2025, 7, 30), date(2025, 9, 17),
+    date(2025, 10, 29), date(2025, 12, 10),
+    # 2026
+    date(2026, 1, 28), date(2026, 3, 18), date(2026, 5, 6),
+    date(2026, 6, 17), date(2026, 7, 29), date(2026, 9, 16),
+    date(2026, 10, 28), date(2026, 12, 9),
+    # 2027 (approximate — update when Fed publishes official calendar)
+    date(2027, 1, 27), date(2027, 3, 17), date(2027, 5, 5),
+    date(2027, 6, 16), date(2027, 7, 28), date(2027, 9, 15),
+    date(2027, 10, 27), date(2027, 12, 8),
+]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -111,6 +144,98 @@ def fetch_vix6m() -> float:
                 time.sleep(RETRY_DELAY * attempt)
             else:
                 raise
+
+
+def fetch_fomc_dates() -> list[date]:
+    """
+    Fetch upcoming FOMC announcement dates (last day of each 2-day meeting)
+    from the Federal Reserve website.
+
+    Tries two parse strategies against the Fed's FOMC calendar page:
+      1. <time datetime="YYYY-MM-DD"> attributes (cleanest signal)
+      2. "Month DD-DD" text patterns within year-labelled sections
+
+    Falls back to FOMC_DATES_FALLBACK on any import error, network error,
+    or zero-result parse.  Only returns dates >= today.
+    """
+    today = date.today()
+    url   = "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm"
+
+    try:
+        from bs4 import BeautifulSoup
+
+        resp = requests.get(
+            url, timeout=15,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; monitor/3.1)"},
+        )
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        MONTH_NUM = {
+            "january": 1, "february": 2, "march": 3, "april": 4,
+            "may": 5, "june": 6, "july": 7, "august": 8,
+            "september": 9, "october": 10, "november": 11, "december": 12,
+        }
+
+        parsed: list[date] = []
+
+        # ── Strategy 1: semantic <time datetime="YYYY-MM-DD"> tags ──────────
+        for tag in soup.find_all("time", attrs={"datetime": True}):
+            dt_str = str(tag.get("datetime", ""))
+            m = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", dt_str)
+            if m:
+                d = date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+                if d >= today:
+                    parsed.append(d)
+
+        if parsed:
+            logging.info("FOMC: %d upcoming dates via <time datetime> tags", len(parsed))
+            return sorted(set(parsed))
+
+        # ── Strategy 2: year-panel scan + "Month DD-DD" text patterns ───────
+        for section in soup.find_all(["div", "section"]):
+            heading = section.find(re.compile(r"^h[1-6]$"))
+            if not heading:
+                continue
+            year_m = re.search(r"\b(20\d{2})\b", heading.get_text())
+            if not year_m:
+                continue
+            year = int(year_m.group(1))
+            if year < today.year:
+                continue
+
+            for text in section.strings:
+                m = re.search(
+                    r"(January|February|March|April|May|June|July|August|"
+                    r"September|October|November|December)"
+                    r"[^0-9]*(\d{1,2})[-–](\d{1,2})",
+                    str(text), re.IGNORECASE,
+                )
+                if m:
+                    month = MONTH_NUM.get(m.group(1).lower(), 0)
+                    day   = int(m.group(3))  # last day of meeting = announcement day
+                    if month:
+                        try:
+                            d = date(year, month, day)
+                            if d >= today:
+                                parsed.append(d)
+                        except ValueError:
+                            pass
+
+        if parsed:
+            logging.info("FOMC: %d upcoming dates via text scan", len(parsed))
+            return sorted(set(parsed))
+
+        logging.warning("FOMC: Fed website returned 0 parseable dates — using fallback")
+
+    except ImportError:
+        logging.warning("FOMC: beautifulsoup4 not installed — using fallback")
+    except Exception as exc:
+        logging.warning("FOMC: fetch failed (%s) — using fallback", exc)
+
+    fallback = sorted(d for d in FOMC_DATES_FALLBACK if d >= today)
+    logging.info("FOMC: using %d hardcoded fallback dates", len(fallback))
+    return fallback
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -218,6 +343,43 @@ def evaluate_exit(m: dict) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# FOMC check
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fomc_check(fomc_dates: list[date]) -> dict:
+    """
+    Determine whether today falls within the Tier 1 FOMC hold window.
+
+    Hold window (calendar days):
+      [FOMC date − FOMC_PRE_HOLD_DAYS,  FOMC date + FOMC_POST_HOLD_DAYS]
+      i.e. 3 days before through 1 day after → hold
+      First safe Tier 1 entry = FOMC date + FOMC_POST_HOLD_DAYS + 1
+
+    Returns
+    -------
+    dict with keys:
+      hold        : bool — Tier 1 entry should be delayed
+      fomc_date   : date | None — the triggering FOMC announcement date
+      days_to_fomc: int  | None — signed offset (+ = upcoming, − = past)
+      enter_after : date | None — earliest safe Tier 1 entry date
+    """
+    today = date.today()
+
+    for fomc_date in sorted(fomc_dates):
+        days_to = (fomc_date - today).days   # positive = future, negative = past
+        if -FOMC_POST_HOLD_DAYS <= days_to <= FOMC_PRE_HOLD_DAYS:
+            enter_after = fomc_date + timedelta(days=FOMC_POST_HOLD_DAYS + 1)
+            return {
+                "hold":         True,
+                "fomc_date":    fomc_date,
+                "days_to_fomc": days_to,
+                "enter_after":  enter_after,
+            }
+
+    return {"hold": False, "fomc_date": None, "days_to_fomc": None, "enter_after": None}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Message formatting
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -225,14 +387,19 @@ def ck(flag: bool) -> str:
     return "✅" if flag else "❌"
 
 
-def build_message(m: dict, entry: dict, ex: dict) -> str:
+def _fmt_date(d: date) -> str:
+    """Format a date as '18 Mar' (no leading zero, locale-independent)."""
+    return f"{d.day} {d.strftime('%b')}"
+
+
+def build_message(m: dict, entry: dict, ex: dict, fomc: dict) -> str:
     today    = date.today().strftime("%A, %d %b %Y")
     vix      = m["vix"]
     contango = m["contango"]
     c        = entry["checks"]
 
     lines = [
-        "📉 <b>Short 4M VIX Monitor</b>  (v3.0)",
+        "📉 <b>Short 4M VIX Monitor</b>  (v3.1)",
         f"📅 {today}",
         "",
         f"  VIX spot         : <b>{vix:.2f}</b>",
@@ -247,7 +414,7 @@ def build_message(m: dict, entry: dict, ex: dict) -> str:
     if ex["hard"]:
         lines += [
             "━━━━━━━━━━━━━━━━━━━━━━━",
-            f"🚨 <b>IMMEDIATE EXIT</b>",
+            "🚨 <b>IMMEDIATE EXIT</b>",
             f"   VIX {vix:.2f} > {EXIT_HARD_VIX:.0f} — close position NOW",
             "━━━━━━━━━━━━━━━━━━━━━━━",
             "",
@@ -255,7 +422,7 @@ def build_message(m: dict, entry: dict, ex: dict) -> str:
     elif ex["urgent"]:
         lines += [
             "━━━━━━━━━━━━━━━━━━━━━━━",
-            f"🔴 <b>URGENT EXIT</b>",
+            "🔴 <b>URGENT EXIT</b>",
             f"   VIX {vix:.2f} > EWMA×1.15 ({ex['ewma_threshold']:.2f}) — review/reduce",
             "━━━━━━━━━━━━━━━━━━━━━━━",
             "",
@@ -281,6 +448,25 @@ def build_message(m: dict, entry: dict, ex: dict) -> str:
         f"  {ck(c['t2_avg'])}  20d avg {m['avg_20d']:.2f} &lt; {TIER2_20D_MAX}",
         "",
     ]
+
+    # ── FOMC advisory (Tier 1 only) ───────────────────────────────────────
+    if fomc["hold"] and entry["tier"] == 1:
+        fd   = fomc["fomc_date"]
+        ea   = fomc["enter_after"]
+        ddays = fomc["days_to_fomc"]
+
+        if ddays > 0:
+            timing = f"FOMC in {ddays} day{'s' if ddays > 1 else ''} ({_fmt_date(fd)})"
+        elif ddays == 0:
+            timing = f"FOMC announcement today ({_fmt_date(fd)})"
+        else:
+            timing = f"FOMC {-ddays} day{'s' if -ddays > 1 else ''} ago ({_fmt_date(fd)})"
+
+        lines += [
+            f"⚠️  {timing}",
+            f"   Delay Tier 1 entry — wait until {_fmt_date(ea)} (post-FOMC vol compression)",
+            "",
+        ]
 
     # ── Final verdict ─────────────────────────────────────────────────────
     if entry["tier"] == 1:
@@ -346,10 +532,12 @@ def main() -> None:
     try:
         vix_series = fetch_vix_series(period="60d")
         vix6m      = fetch_vix6m()
+        fomc_dates = fetch_fomc_dates()
         metrics    = compute_metrics(vix_series, vix6m)
         entry      = evaluate_entry(metrics)
         exits      = evaluate_exit(metrics)
-        message    = build_message(metrics, entry, exits)
+        fomc       = fomc_check(fomc_dates)
+        message    = build_message(metrics, entry, exits, fomc)
 
         logging.info("\n%s", message)
         send_telegram(bot_token, chat_id, message)
