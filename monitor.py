@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-monitor.py — Short 4-Month VIX Futures entry/exit monitor (v3.1)
+monitor.py — Short 4-Month VIX Futures entry/exit monitor (v3.2)
 
 Strategy:
   TIER 1 (aggressive): VIX < 18  AND contango ≥ 3.0 pts
@@ -11,6 +11,11 @@ Dynamic sizing (0.5×–1.5× based on VIX level):
   VIX ≤ 12  → 1.5×
   VIX = 18  → 1.0×   (linear 12→18)
   VIX = 22  → 0.5×   (linear 18→22)
+
+Contango boost (+0.2×):
+  When contango (6M−spot) ≥ 3.5 pts AND an entry signal is active,
+  add 0.2× to the base dynamic size.  Highest-conviction environments
+  only (deep, steep term structure = favourable roll yield).
 
 Exit triggers (checked every day regardless of entry):
   IMMEDIATE : VIX > 35
@@ -64,6 +69,10 @@ EXIT_EWMA_MULT  = 1.15   # Urgent exit if VIX > EWMA × this
 SIZE_LOW_VIX    = 12.0   # VIX ≤ this → 1.5× (max size)
 SIZE_MID_VIX    = 18.0   # VIX = this → 1.0×
 SIZE_HIGH_VIX   = 22.0   # VIX = this → 0.5× (min size for entry)
+
+# ── Contango boost ────────────────────────────────────────────────────────────
+CONTANGO_BOOST_THRESHOLD = 3.5   # Contango (pts) required to trigger boost
+CONTANGO_BOOST_SIZE      = 0.2   # Additional position size added when triggered
 
 RETRIES         = 3
 RETRY_DELAY     = 5      # seconds × attempt number
@@ -166,7 +175,7 @@ def fetch_fomc_dates() -> list[date]:
 
         resp = requests.get(
             url, timeout=15,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; monitor/3.1)"},
+            headers={"User-Agent": "Mozilla/5.0 (compatible; monitor/3.2)"},
         )
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
@@ -289,9 +298,11 @@ def dynamic_size(vix: float) -> float:
 def evaluate_entry(m: dict) -> dict:
     """
     Returns:
-      tier   : 1 | 2 | 0  (0 = no entry signal)
-      size   : float
-      checks : dict of individual condition booleans (for display)
+      tier          : 1 | 2 | 0  (0 = no entry signal)
+      size          : float  (base size + contango boost if applicable)
+      base_size     : float  (dynamic size before boost)
+      contango_boost: bool   (True when +0.2× boost was applied)
+      checks        : dict of individual condition booleans (for display)
     """
     vix      = m["vix"]
     contango = m["contango"]
@@ -309,20 +320,28 @@ def evaluate_entry(m: dict) -> dict:
     tier1_ok = t1_vix and t1_cont
     tier2_ok = t2_vix and t2_cont and t2_avg
 
+    # Contango boost: active on any entry signal when contango ≥ 3.5 pts
+    cont_boost = contango >= CONTANGO_BOOST_THRESHOLD
+
     checks = {
-        "t1_vix":  t1_vix,
-        "t1_cont": t1_cont,
-        "t2_vix":  t2_vix,
-        "t2_cont": t2_cont,
-        "t2_avg":  t2_avg,
+        "t1_vix":       t1_vix,
+        "t1_cont":      t1_cont,
+        "t2_vix":       t2_vix,
+        "t2_cont":      t2_cont,
+        "t2_avg":       t2_avg,
+        "cont_boost":   cont_boost,
     }
 
-    if tier1_ok:
-        return {"tier": 1, "size": dynamic_size(vix), "checks": checks}
-    elif tier2_ok:
-        return {"tier": 2, "size": dynamic_size(vix), "checks": checks}
-    else:
-        return {"tier": 0, "size": 0.0, "checks": checks}
+    if tier1_ok or tier2_ok:
+        tier      = 1 if tier1_ok else 2
+        base      = dynamic_size(vix)
+        boosted   = cont_boost
+        final_size = round(base + (CONTANGO_BOOST_SIZE if boosted else 0.0), 2)
+        return {"tier": tier, "size": final_size, "base_size": base,
+                "contango_boost": boosted, "checks": checks}
+
+    return {"tier": 0, "size": 0.0, "base_size": 0.0,
+            "contango_boost": False, "checks": checks}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -399,7 +418,7 @@ def build_message(m: dict, entry: dict, ex: dict, fomc: dict) -> str:
     c        = entry["checks"]
 
     lines = [
-        "📉 <b>Short 4M VIX Monitor</b>  (v3.1)",
+        "📉 <b>Short 4M VIX Monitor</b>  (v3.2)",
         f"📅 {today}",
         "",
         f"  VIX spot         : <b>{vix:.2f}</b>",
@@ -447,6 +466,9 @@ def build_message(m: dict, entry: dict, ex: dict, fomc: dict) -> str:
         f"  {ck(c['t2_cont'])}  Contango {contango:+.2f} ≥ {TIER2_CONTANGO}",
         f"  {ck(c['t2_avg'])}  20d avg {m['avg_20d']:.2f} &lt; {TIER2_20D_MAX}",
         "",
+        "<b>Contango Boost</b> (+0.2× when contango ≥3.5):",
+        f"  {ck(c['cont_boost'])}  Contango {contango:+.2f} ≥ {CONTANGO_BOOST_THRESHOLD}",
+        "",
     ]
 
     # ── FOMC advisory (Tier 1 only) ───────────────────────────────────────
@@ -470,26 +492,34 @@ def build_message(m: dict, entry: dict, ex: dict, fomc: dict) -> str:
 
     # ── Final verdict ─────────────────────────────────────────────────────
     if entry["tier"] == 1:
+        size_detail = f"{entry['base_size']}× base"
+        if entry["contango_boost"]:
+            size_detail += f" + {CONTANGO_BOOST_SIZE}× contango boost"
         lines += [
             "━━━━━━━━━━━━━━━━━━━━━━━",
             "🟢 <b>TIER 1 ENTRY SIGNAL</b>",
-            f"   Position size: <b>{entry['size']}×</b>  (aggressive)",
+            f"   Position size: <b>{entry['size']}×</b>  ({size_detail})",
             "   Short 4-month VIX futures",
             "━━━━━━━━━━━━━━━━━━━━━━━",
         ]
     elif entry["tier"] == 2:
+        size_detail = f"{entry['base_size']}× base"
+        if entry["contango_boost"]:
+            size_detail += f" + {CONTANGO_BOOST_SIZE}× contango boost"
         lines += [
             "━━━━━━━━━━━━━━━━━━━━━━━",
             "🟡 <b>TIER 2 ENTRY SIGNAL</b>",
-            f"   Position size: <b>{entry['size']}×</b>  (moderate)",
+            f"   Position size: <b>{entry['size']}×</b>  ({size_detail})",
             "   Short 4-month VIX futures",
             "━━━━━━━━━━━━━━━━━━━━━━━",
         ]
     else:
+        boost_note = f"  Contango boost: {ck(c['cont_boost'])} (≥{CONTANGO_BOOST_THRESHOLD} pts — activates on entry)"
         lines += [
             "━━━━━━━━━━━━━━━━━━━━━━━",
             "⏳ <b>NO ENTRY SIGNAL</b>",
             "   Conditions not fully met — monitor tomorrow",
+            boost_note,
             "━━━━━━━━━━━━━━━━━━━━━━━",
         ]
 
